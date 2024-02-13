@@ -1,0 +1,109 @@
+#!/usr/bin/expect -f
+# Script Description: This script automates the process of changing WLAN passwords for multiple devices and logging the activity. It also sends an email notification upon successful completion.
+# Date of Creation: February 13, 2024 by Peter Hendlinger
+# change your credentials, email and ip's accordingly
+
+# Input file containing passwords for each month
+set file [lindex $argv 0]
+
+# Function to get the current month and corresponding password from the file
+proc get_month_password {} {
+   set months {
+        January February March April May June July August September October November December
+    }
+    set current_month [lindex $months [expr {[clock format [clock seconds] -format %m] - 1}]]
+    set password [exec grep "^$current_month" passwords.txt | cut -d, -f2]
+    return $password
+}
+
+# Function to log activity
+proc log_activity {hostname timestamp activity} {
+    set log_entry "$timestamp: $activity\n"
+    set log_file_handle [open [file join [file dirname [info script]] "log" "activity_log_$hostname.txt"] a]
+    puts $log_file_handle $log_entry
+    close $log_file_handle
+}
+
+# Function to send email with attachment using mailx
+proc send_email {subject body attachment} {
+    set from_address "email@from.com"
+    set to_address "email@to.com"
+
+    set command "echo '$body' | mailx -s '$subject' -r $from_address -A $attachment $to_address"
+    spawn bash -c $command
+    expect eof
+}
+
+# Neuestes Passwort aus der Datei abrufen und ausgeben
+set new_password [get_month_password]
+
+# Ausgabe des Passworts
+puts "Latest Password: $new_password"
+
+# TFTP-Parameter
+set tftp_address "your ip"
+set tftp_protocol "binary"
+set tftp_name "config.txt"
+# Benutzername und Passwort
+set username username
+set password password
+
+# Durchlaufen jeder Zeile in der Datei
+set fp [open $file r]
+while {[gets $fp line] != -1} {
+    set ip [lindex [split $line ","] 0]
+    set hostname [lindex [split $line ","] 1]
+    set wlan_id [lindex [split $line ","] 2]
+
+    # Prüfen, ob der Switch erreichbar ist
+    spawn ping $ip
+    expect {
+        timeout { puts "Ping fehlgeschlagen"; exit 1 }
+        "ttl=" { puts "Switch ist erreichbar" }
+    }
+
+    # SSH-Verbindung zum WLC herstellen
+    spawn ssh -o StrictHostKeyChecking=no $username@$ip
+    expect {
+        timeout { puts "SSH-Verbindung fehlgeschlagen"; exit 1 }
+        "User:" { send "$username\r"; exp_continue }
+        "Password:" { send "$password\r" }
+        expect ">"
+    }
+
+    # Logge Aktivität
+    set timestamp [clock format [clock seconds] -format "%Y-%m-%d %H:%M:%S"]
+    log_activity $hostname $timestamp "Attempting to change configuration for $hostname (WLAN ID: $wlan_id)"
+
+    # neues psk password setzen hier
+    # Logge die Konfigurationsänderungen
+    log_activity $hostname $timestamp "config wlan disable $wlan_id"
+    send "config wlan disable $wlan_id\r"
+    expect ">"
+
+    log_activity $hostname $timestamp "config wlan security wpa akm psk set-key ascii $new_password $wlan_id"
+    send "config wlan security wpa akm psk set-key ascii $new_password $wlan_id\r"
+    expect ">"
+
+    log_activity $hostname $timestamp "config wlan enable $wlan_id"
+    send "config wlan enable $wlan_id\r"
+    expect ">"
+
+    # Setzten der parameter
+    log_activity $hostname $timestamp "transfer upload filename $hostname"
+    send "transfer upload filename $hostname\r"
+    expect ">"
+
+    log_activity $hostname $timestamp "transfer upload serverip $tftp_address"
+    send "transfer upload serverip $tftp_address\r"
+    expect ">"
+
+    log_activity $hostname $timestamp "transfer upload path /"
+    send "transfer upload path /\r"
+    expect ">"
+
+    log_activity $hostname $timestamp "transfer upload datatype config"
+    send "transfer upload datatype config\r"
+    expect ">"
+
+    log_activity $hostname $timestamp "transfer upload mode tftp"
