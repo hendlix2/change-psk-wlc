@@ -1,0 +1,112 @@
+
+#!/usr/bin/expect -f
+
+# Input file containing passwords for each month
+set file [lindex $argv 0]
+
+# Function to get the current month and corresponding password from the file
+proc get_month_password {} {
+    set months {
+        January February March April May June July August September October November December
+    }
+    set current_month [lindex $months [expr {[clock format [clock seconds] -format %m] - 1}]]
+    set password [exec grep "^$current_month" passwords.txt | cut -d, -f2]
+    return $password
+}
+
+# Function to log activity
+proc log_activity {hostname timestamp activity} {
+    set log_entry "$timestamp: $activity\n"
+    set log_file_handle [open [file join [file dirname [info script]] "log" "activity_log_$hostname.txt"] a]
+    puts $log_file_handle $log_entry
+    close $log_file_handle
+}
+
+# Function to send email with attachment using mailx
+proc send_email {subject body attachment} {
+    set from_address "sent@from.com"
+    set to_address "sent@to.com"   # komma seperated if you want sent to mutliple receivers
+    set command "echo '$body' | mailx -s '$subject' -r $from_address -A $attachment $to_address"
+    spawn bash -c $command
+    expect eof
+}
+
+# Latest password retrieval
+set new_password [get_month_password]
+
+# Output the password
+puts "Latest Password: $new_password"
+
+# TFTP parameters
+set tftp_address "10.220.0.50"
+set username "username"
+set password "password"
+
+# Processing each line in the file
+set fp [open $file r]
+while {[gets $fp line] != -1} {
+    set ip [lindex [split $line ","] 0]
+    set hostname [lindex [split $line ","] 1]
+    set wlan_id [lindex [split $line ","] 2]
+
+    # Ping to check if the switch is reachable
+    spawn ping -c 4 $ip
+    expect {
+        timeout { puts "Ping failed"; exit 1 }
+        "64 bytes" { puts "Switch is reachable" }
+    }
+
+    # SSH connection to WLC
+    spawn ssh -o StrictHostKeyChecking=no $username@$ip
+    expect {
+        timeout { puts "SSH connection failed"; exit 1 }
+        "Password:" { send "$password\r" }
+    }
+    expect ">"
+    send "enable\r"
+    expect "Password:"
+    send "$password\r"
+    expect "#"
+
+    # Enter configuration mode
+    send "conf t\r"
+    expect "(config)#"
+
+    # Log and execute configuration changes
+    set timestamp [clock format [clock seconds] -format "%Y-%m-%d %H:%M:%S"]
+
+    # Disable WLAN
+#   send "config wlan disable $wlan_id\r"
+    send "wlan AKGuest $wlan_id AKGuest\r"
+    send "shutdown\r"
+    expect "(config)#"
+    log_activity $hostname $timestamp "config wlan disable $wlan_id"
+
+    # Set new PSK password
+    send "security wpa psk set-key ascii 0  $new_password\r"
+    expect "(config)#"
+    log_activity $hostname $timestamp "security wpa psk set-key ascii 0  $new_password"
+
+    # Enable WLAN
+    send "no shutdown\r"
+    expect "(config)#"
+    log_activity $hostname $timestamp "config wlan enable $wlan_id"
+
+    # Exit configuration mode
+    send "end\r"
+    expect "#"
+    send "wr me\r"
+    expect "#"
+    log_activity $hostname $timestamp "Configuration saved with 'wr m'"
+
+    # Logout
+    send "logout\r"
+    expect eof
+
+    # Send an email for each device
+    set subject "Guest WLAN Password for $hostname"
+    set body "Please see attached log for configuration changes."
+    send_email $subject $body [file join [file dirname [info script]] "log" "activity_log_$hostname.txt"]
+}
+# Close the file
+close $fp
